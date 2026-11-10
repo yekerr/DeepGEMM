@@ -25,6 +25,9 @@ public:
         // TODO: move into descriptor
         int gran_k_a, gran_k_b, k_alignment;
 
+        // The FP8-output batched GEMM may run the epilogue-v3 kernel (two epilogue warpgroups, packed SF words)
+        bool epilogue_v3 = false;
+
         void* grouped_layout;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -38,13 +41,13 @@ public:
         //        Both share the same kernel template and only differ in the operand dtype strings.
         const auto a_dtype = to_string(args.gemm_desc.a_dtype, not args.gemm_desc.is_mxf4_mma());
         const auto b_dtype = to_string(args.gemm_desc.b_dtype, not args.gemm_desc.is_mxf4_mma());
-        const auto kernel = jit->compile(tag, std::format(R"(
-#include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
+        const auto kernel = jit->compile(args.epilogue_v3 ? tag + "_v3" : tag, std::format(R"(
+#include <deep_gemm/impls/{}>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_gemm_1d1d_impl<
+    auto ptr = reinterpret_cast<void*>(&{}<
         {}, {},
         {}, {}, {},
         {}, {}, {},
@@ -62,6 +65,8 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        args.epilogue_v3 ? "sm100_fp8_fp4_gemm_1d1d_v3.cuh" : "sm100_fp8_fp4_gemm_1d1d.cuh",
+        args.epilogue_v3 ? "sm100_fp8_fp4_gemm_1d1d_v3_impl" : "sm100_fp8_fp4_gemm_1d1d_impl",
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         args.gran_k_a, args.gran_k_b, args.k_alignment,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
