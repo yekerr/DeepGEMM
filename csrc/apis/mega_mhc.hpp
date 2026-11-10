@@ -20,6 +20,13 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
+    // Test hook: DG_MEGA_MHC_NUM_SPLITS pins the split count (1..kNumMaxSplits, at most hidden / BLOCK_K).
+    if (const auto pinned = deep_jit::get_env<int>("DG_MEGA_MHC_NUM_SPLITS"); pinned > 0) {
+        DG_HOST_ASSERT(static_cast<uint32_t>(pinned) <= mhc_layout::kNumMaxSplits and
+                       static_cast<uint32_t>(pinned) <= hidden / mhc_layout::BLOCK_K);
+        return static_cast<uint32_t>(pinned);
+    }
+
     // Fewest splits that still reach the shortest possible longest task
     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
     const uint32_t max_num_splits = cute::min(
