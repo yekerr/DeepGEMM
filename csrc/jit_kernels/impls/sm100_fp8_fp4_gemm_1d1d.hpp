@@ -408,6 +408,70 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::stable::Tensor& a, const 
     });
 }
 
+// Layout and epilogue of the FP8-output batched GEMM of the DeepSeek-V4.1 wo_a einsum ("bhr,hdr->bhd", recipe (1, 1, 32),
+// G = 8, N = 1024, K = 4096) per M range, measured on VR200 (212 SMs) at the served decode shapes. `epilogue`: 0 = stock store,
+// 4 = epilogue v3. `grid_sms` > 0 sizes the persistent grid so the tiles fill whole waves. Shapes outside every row keep
+// DeepGEMM's own heuristic.
+struct EinsumLayoutRule {
+    int num_groups, n, k, num_sms, m_lo, m_hi;
+    int swap_ab, block_m, block_n, cluster_m, cluster_n, epilogue;
+    int grid_sms;
+};
+static constexpr EinsumLayoutRule kEinsumLayoutRules[] = {
+    {8, 1024, 4096, 212, 1, 48, 1, 16, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 49, 96, 1, 32, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 97, 144, 1, 48, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 145, 192, 1, 64, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 193, 240, 1, 80, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 241, 288, 1, 96, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 289, 336, 1, 112, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 337, 384, 1, 128, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 385, 432, 1, 144, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 433, 480, 1, 160, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 481, 528, 1, 176, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 529, 576, 1, 192, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 577, 624, 1, 208, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 625, 672, 1, 224, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 673, 720, 1, 240, 128, 1, 2, 4, 0},
+    {8, 1024, 4096, 212, 721, 744, 1, 128, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 793, 864, 1, 144, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 865, 960, 1, 160, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 961, 1056, 1, 176, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1057, 1152, 1, 192, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1153, 1248, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1249, 1344, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1345, 1440, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1441, 1464, 1, 176, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1561, 1584, 1, 176, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1585, 1728, 1, 192, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1729, 1872, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 1873, 2016, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2017, 2160, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2161, 2304, 1, 192, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2305, 2496, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2497, 2688, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2689, 2880, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 2881, 3120, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 3121, 3360, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 3361, 3600, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 3601, 3744, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 3745, 4032, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 4033, 4320, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 4321, 4368, 1, 208, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 4369, 4704, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 4705, 5040, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 5041, 5376, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 5377, 5760, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 5761, 6048, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 6049, 6480, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 6481, 6720, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 6721, 7200, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 7201, 7392, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 7393, 7920, 1, 240, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 7921, 8064, 1, 224, 128, 1, 2, 4, 192},
+    {8, 1024, 4096, 212, 8065, 1073741824, 1, 240, 128, 1, 2, 4, 192}
+};
+
 static void sm100_fp8_bmm(const torch::stable::Tensor& a, const torch::stable::Tensor& sfa,
                           const torch::stable::Tensor& b, const torch::stable::Tensor& sfb,
                           const std::optional<torch::stable::Tensor>& c,
@@ -429,7 +493,41 @@ static void sm100_fp8_bmm(const torch::stable::Tensor& a, const torch::stable::T
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
-    const auto config = get_best_config<SM100ArchSpec>(desc);
+    auto config = get_best_config<SM100ArchSpec>(desc);
+    bool epilogue_v3 = false;
+    // Switch DG_MOSCA_EINSUM_RULE (read per call, before any CUDA-graph capture). Unset or 0 = DeepGEMM's own heuristic
+    // for every shape (stock, the default); 1 = the kEinsumLayoutRules rows (bitwise to stock, measured on VR200).
+    if (deep_jit::get_env<int>("DG_MOSCA_EINSUM_RULE") > 0 and
+        d.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn and gran_k_a == 32 and gran_k_b == 32) {
+        for (const auto& r: kEinsumLayoutRules) {
+            if (batch_size == r.num_groups and n == r.n and k == r.k and desc.num_sms == r.num_sms and r.m_lo <= m and m <= r.m_hi) {
+                auto rule_desc = desc;
+                if (r.grid_sms > 0 and r.grid_sms <= desc.num_sms)
+                    rule_desc.num_sms = r.grid_sms;
+                config = get_config_for_layout<SM100ArchSpec>(
+                    rule_desc, Layout{r.swap_ab, r.block_m, r.block_n, config.layout.block_k, r.cluster_m, r.cluster_n});
+                if (r.epilogue == 4 and config.layout.swap_ab and config.layout.block_m <= 240) {
+                    // Two epilogue warpgroups with two TMA-store buffers each, plus one packed-SF word per token row
+                    epilogue_v3 = true;
+                    config.launch_config.num_epilogue_threads = 256;
+                    config.launch_config.num_threads = config.launch_config.num_non_epilogue_threads + 256;
+                    config.pipeline_config.num_tma_store_stages = 4;
+                    config.pipeline_config.smem_size += 2 * config.storage_config.store_block_m * config.storage_config.store_block_n +
+                                                        config.layout.block_m * 4;
+                    if (config.pipeline_config.smem_size > SM100ArchSpec::smem_capacity) {
+                        const int per_stage = config.storage_config.load_block_m * config.layout.block_k +
+                                              config.storage_config.load_block_n * config.layout.block_k +
+                                              align(config.layout.block_m, 128) * config.layout.block_k / 32 +
+                                              align(config.layout.block_n, 128) * config.layout.block_k / 32;
+                        config.pipeline_config.num_stages -= 1;
+                        config.pipeline_config.smem_size -= per_stage;
+                    }
+                    DG_HOST_ASSERT(config.pipeline_config.smem_size <= SM100ArchSpec::smem_capacity);
+                }
+                break;
+            }
+        }
+    }
 
     const int load_block_m = config.storage_config.load_block_m;
     const auto [inner_dim_a, outer_dim_a] = get_inner_outer_dims(major_a, k, m);
@@ -477,6 +575,7 @@ static void sm100_fp8_bmm(const torch::stable::Tensor& a, const torch::stable::T
         .gran_k_b = gran_k_b,
         // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
         .k_alignment = gran_k_a,
+        .epilogue_v3 = epilogue_v3,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

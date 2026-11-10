@@ -14,6 +14,18 @@
 
 namespace deep_gemm {
 
+// The full config of a given layout (storage, pipeline and launch derived the heuristic's way)
+template <typename ArchSpec>
+static GemmConfig get_config_for_layout(const GemmDesc& desc, const Layout& layout) {
+    const auto storage_config = ArchSpec::get_storage_config(desc, layout);
+    return GemmConfig {
+        .layout = layout,
+        .storage_config = storage_config,
+        .pipeline_config = ArchSpec::get_pipeline_config(desc, layout, storage_config),
+        .launch_config = ArchSpec::get_launch_config(desc, layout)
+    };
+}
+
 template <typename ArchSpec>
 static GemmConfig get_best_config(const GemmDesc& desc) {
     desc.check_validity();
