@@ -35,7 +35,7 @@ constexpr uint32_t kNumTokenRowsPerLane = 2;
 // Persistent mHC with static grid-stride roles and TMA-native layouts.
 // Norm receives one arrival only after Shifted X1 stores and statistics are committed.
 template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
-          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M>
+          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kFIFP8 = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     sm100_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_x,
@@ -59,6 +59,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     DG_STATIC_ASSERT(kHidden > 0 and kHidden % BLOCK_K == 0 and kNumSplits <= kHidden / BLOCK_K,
                      "Splits must contain nonempty, aligned K blocks");
     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
+    DG_STATIC_ASSERT(not kFIFP8 or (kIsShifted and kStoreBF16 and not kStoreFP8),
+                     "FlashInfer-format FP8 is a Shifted BF16 extra output");
 
     // MMA and tensor memory configs
     constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
@@ -658,6 +660,10 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         if constexpr (kIsShifted) {
             cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
             const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
+            if constexpr (kFIFP8) {
+                if (blockIdx.x == kNumSMs - 1 and warp_idx_in_mix_wg == kNumWarpsPerWG - 1)
+                    epilogue::mega_mhc::zero_fi_sf_padding<kHidden>(norm_args, lane_idx);
+            }
             for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
                  token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
                 epilogue::mega_mhc::run_mix_task<kHidden, true>(
@@ -685,7 +691,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
         if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
             epilogue::mega_mhc::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
-                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kFIFP8>(
                 smem, workspace, gmem_split_barriers, norm_args, lane_idx);
         }
     }

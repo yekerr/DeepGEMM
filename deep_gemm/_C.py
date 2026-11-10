@@ -385,6 +385,7 @@ def mega_mhc(
     y_routed_sf=None,
     y_shared_sf=None,
     shared_sf_block_m=0,
+    y_fi_sf=None,
 ):
     return _torch_ops.mega_mhc(
         x,
@@ -414,6 +415,7 @@ def mega_mhc(
         y_routed_sf,
         y_shared_sf,
         shared_sf_block_m,
+        y_fi_sf,
     )
 
 

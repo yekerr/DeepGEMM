@@ -31,8 +31,12 @@ static void sm100_mega_mhc(
     const std::optional<torch::stable::Tensor>& y_primary_sf,
     const std::optional<torch::stable::Tensor>& y_shared_sf,
     const int& shared_sf_block_m, const float& rmsnorm_scale,
-    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms) {
+    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms,
+    const std::optional<torch::stable::Tensor>& y_fi_sf = std::nullopt) {
     const bool is_shifted = shifted_prev_mix.has_value();
+    // FlashInfer-format FP8 (y_fi_sf) writes E4M3 into y_fp8 and F8_128x4 UE8M0 bytes into y_fi_sf; it is not the
+    // DeepGEMM FP8 output mode (kStoreFP8), which keeps its own scale layouts.
+    const bool store_fi_fp8 = y_fi_sf.has_value();
 
     const auto make_hidden_tma_desc = [&](const torch::stable::Tensor& tensor) {
         return make_tma_2d_desc(tensor, hidden, num_tokens, mhc_layout::BLOCK_K, mhc_layout::BLOCK_M,
@@ -99,14 +103,15 @@ static void sm100_mega_mhc(
         .scale = rmsnorm_scale,
         .y_bf16 = reinterpret_cast<nv_bfloat16*>(y_bf16.mutable_data_ptr()),
         .y_fp8 = y_fp8.has_value() ? reinterpret_cast<__nv_fp8_e4m3*>(y_fp8->mutable_data_ptr()) : nullptr,
-        .y_primary_sf = y_primary_sf.has_value() ? reinterpret_cast<uint32_t*>(y_primary_sf->mutable_data_ptr<int32_t>()) : nullptr,
+        .y_primary_sf = store_fi_fp8 ? reinterpret_cast<uint32_t*>(y_fi_sf->mutable_data_ptr()) :
+                        y_primary_sf.has_value() ? reinterpret_cast<uint32_t*>(y_primary_sf->mutable_data_ptr<int32_t>()) : nullptr,
         .y_primary_sf_stride_token = y_primary_sf.has_value() ? y_primary_sf->stride(0) : 0,
         .y_primary_sf_stride_word = y_primary_sf.has_value() ? y_primary_sf->stride(1) : 0,
         .y_shared_sf = y_shared_sf.has_value() ? reinterpret_cast<uint32_t*>(y_shared_sf->mutable_data_ptr<int32_t>()) : nullptr,
         .y_shared_sf_stride_word = y_shared_sf.has_value() ? y_shared_sf->stride(1) : 0,
     };
 
-    // Compile
+    // Compile (the FlashInfer-format FP8 flag is appended only when set, so the stock source string is unchanged)
     const auto kernel = jit->compile("sm100_mega_mhc", std::format(R"(
 #include <deep_gemm/impls/sm100_mega_mhc.cuh>
 
@@ -115,15 +120,16 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
         {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}{}
     >);
 }};
 )",
         hidden, num_splits, num_sms,
         mix_args.new_prev_mix != nullptr,
         store_bf16,
-        norm_args.y_fp8 != nullptr,
-        shared_sf_block_m));
+        norm_args.y_fp8 != nullptr and not store_fi_fp8,
+        shared_sf_block_m,
+        store_fi_fp8 ? std::format(", {}", store_fi_fp8) : std::string()));
 
     // Launch
     jit->launch(

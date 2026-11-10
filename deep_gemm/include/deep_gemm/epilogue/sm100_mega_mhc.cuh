@@ -135,6 +135,64 @@ CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const u
     return __byte_perm(paired_sf, __shfl_xor_sync(0xffffffff, paired_sf, 2 * kNumLanesPerSF), 0x5410);
 }
 
+// FlashInfer-format MXFP8 y for consumers that read F8_128x4 swizzled UE8M0 scales (FlashInfer mxfp8_quantize with
+// is_sf_swizzled_layout=True; vLLM kMxfp8Dynamic): E4M3 values, one scale per 32 values, the scale rule of FlashInfer's
+// float_to_ue8m0_fast / ue8m0_to_inv_scale_fast, derived from the BF16-rounded y. Scales of rows [T, ceil(T/128)*128)
+// are zero. Data: norm_args.y_fp8 [T, H]; scales: norm_args.y_primary_sf as bytes.
+template <uint32_t kHidden>
+CUTLASS_DEVICE uint32_t get_fi_sf_offset(const uint32_t& row, const uint32_t& group) {
+    constexpr uint32_t kGroupWords = (kHidden / kHiddenPerSF + 3) / 4;
+    return (row / 128 * kGroupWords + group / 4) * 512 + row % 32 * 16 + row % 128 / 32 * 4 + group % 4;
+}
+
+template <uint32_t kHidden>
+CUTLASS_DEVICE void store_fi_fp8(const NormArgs& norm_args, const uint32_t& token_idx, const uint32_t& hidden_idx,
+                                 const uint4& values, const uint32_t& lane_idx) {
+    const auto pairs = reinterpret_cast<const nv_bfloat162*>(&values);
+    float f[8];
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; ++ i) {
+        const float2 v = __bfloat1622float2(pairs[i]);
+        f[2 * i] = v.x, f[2 * i + 1] = v.y;
+    }
+    float amax = 0.0f;
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++ i)
+        amax = fmaxf(amax, fabsf(f[i]));
+    amax = math::warp_reduce_max<kNumLanesPerSF>(amax);
+    const float normalized = amax * (1.0f / 448.0f);
+    const uint32_t bits = __float_as_uint(normalized);
+    const uint32_t exponent = (bits >> 23) & 255u, mantissa = bits & 0x7FFFFFu;
+    const uint32_t bump = (mantissa != 0u and not (exponent == 0u and mantissa <= 0x400000u)) ? 1u : 0u;
+    const uint32_t sf = normalized <= 0.0f ? 0u : cute::min(exponent + bump, 254u);
+    const float inv_scale = sf == 0u ? 0.0f : __uint_as_float((254u - sf) << 23);
+    uint32_t packed[2];
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++ i) {
+        const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f[4 * i] * inv_scale, f[4 * i + 1] * inv_scale),
+                                                                 __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f[4 * i + 2] * inv_scale, f[4 * i + 3] * inv_scale),
+                                                                 __NV_SATFINITE, __NV_E4M3);
+        packed[i] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+    }
+    *reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(norm_args.y_fp8) + static_cast<uint64_t>(token_idx) * kHidden + hidden_idx) =
+        make_uint2(packed[0], packed[1]);
+    if (lane_idx % kNumLanesPerSF == 0)
+        reinterpret_cast<uint8_t*>(norm_args.y_primary_sf)[get_fi_sf_offset<kHidden>(token_idx, hidden_idx / kHiddenPerSF)] =
+            static_cast<uint8_t>(sf);
+}
+
+template <uint32_t kHidden>
+CUTLASS_DEVICE void zero_fi_sf_padding(const NormArgs& norm_args, const uint32_t& lane_idx) {
+    constexpr uint32_t kGroupWords = (kHidden / kHiddenPerSF + 3) / 4;
+    const uint32_t padded = (norm_args.num_tokens + 127u) / 128u * 128u;
+    const uint32_t num_words = (padded - norm_args.num_tokens) * kGroupWords;
+    for (uint32_t i = lane_idx; i < num_words; i += 32) {
+        const uint32_t row = norm_args.num_tokens + i / kGroupWords, word = i % kGroupWords;
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(norm_args.y_primary_sf) + get_fi_sf_offset<kHidden>(row, word * 4)) = 0u;
+    }
+}
+
 // A Normal task fuses Mix, Pre, and RMSNorm for one token.
 template <uint32_t kHidden, uint32_t kNumSMs, bool kStoreBF16, bool kStoreFP8,
           uint32_t SF_BLOCK_M, uint32_t kNumSplits>
@@ -288,7 +346,7 @@ struct ShiftedNormPack {
     uint4 weight;
 };
 
-template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kFIFP8, uint32_t kNumSplits>
 CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
                                           const NormArgs& norm_args,
                                           const uint32_t& task_idx,
@@ -357,6 +415,11 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
             if (has_second_token)
                 *reinterpret_cast<uint4*>(norm_args.y_bf16 + output_offset + kHidden) = values[1];
         }
+        if constexpr (kFIFP8) {
+            store_fi_fp8<kHidden>(norm_args, m_idx, hidden_idx, values[0], lane_idx);
+            if (has_second_token)
+                store_fi_fp8<kHidden>(norm_args, m_idx + 1, hidden_idx, values[1], lane_idx);
+        }
         if constexpr (kStoreFP8) {
             const auto values_pairs = reinterpret_cast<const nv_bfloat162(*)[4]>(values);
             // Pack both tokens' amaxes into one BF16 pair to share a single warp reduction
@@ -390,7 +453,7 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
 }
 
 template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumRegisters, bool kStoreBF16, bool kStoreFP8,
-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+          uint32_t SF_BLOCK_M, bool kFIFP8, uint32_t kNumSplits>
 CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
                                             uint64_t* gmem_split_barriers,
                                             const NormArgs& norm_args,
@@ -420,7 +483,7 @@ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace
                                   task_ticket / kNumWarpsPerWG * kNumTasksPerGridWave;
         if (task_idx >= num_tasks)
             return;
-        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kFIFP8>(
             workspace, gmem_split_barriers, norm_args, task_idx, num_partitions, lane_idx);
     }
 }

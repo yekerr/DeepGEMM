@@ -114,14 +114,19 @@ static void mega_mhc(const torch::stable::Tensor& x,
                      const std::optional<torch::stable::Tensor>& y_gemm_sf,
                      const std::optional<torch::stable::Tensor>& y_routed_sf,
                      const std::optional<torch::stable::Tensor>& y_shared_sf,
-                     const int& shared_sf_block_m) {
-    // Shifted state is all-or-nothing; FP8 uses either GEMM SF or routed and shared SF together
+                     const int& shared_sf_block_m,
+                     const std::optional<torch::stable::Tensor>& y_fi_sf = std::nullopt) {
+    // Shifted state is all-or-nothing; FP8 uses either GEMM SF, routed and shared SF together, or (with BF16 y) the
+    // FlashInfer F8_128x4 scale bytes y_fi_sf
     const bool is_shifted = shifted_prev_mix.has_value();
+    const bool fi_fp8 = y_fi_sf.has_value();
     DG_HOST_ASSERT(is_shifted == new_prev_mix.has_value());
     DG_HOST_ASSERT(y_routed_sf.has_value() == y_shared_sf.has_value());
     DG_HOST_ASSERT(not (y_gemm_sf.has_value() and y_routed_sf.has_value()));
     DG_HOST_ASSERT(y_bf16.has_value() or y_fp8.has_value());
-    DG_HOST_ASSERT(y_fp8.has_value() == (y_gemm_sf.has_value() or y_routed_sf.has_value()));
+    DG_HOST_ASSERT(y_fp8.has_value() == (y_gemm_sf.has_value() or y_routed_sf.has_value() or fi_fp8));
+    DG_HOST_ASSERT(not fi_fp8 or (is_shifted and y_bf16.has_value() and not y_gemm_sf.has_value() and
+                                  not y_routed_sf.has_value()));
     DG_HOST_ASSERT(y_shared_sf.has_value() ? shared_sf_block_m > 0 : shared_sf_block_m == 0);
 
     const auto [num_tokens, hidden] = get_shape<2>(x);
@@ -211,6 +216,12 @@ static void mega_mhc(const torch::stable::Tensor& x,
         check_sf(y_routed_sf.value());
         DG_HOST_ASSERT(y_routed_sf->is_contiguous());
     }
+    if (fi_fp8) {
+        DG_HOST_ASSERT(y_fi_sf->scalar_type() == torch::headeronly::ScalarType::Byte);
+        DG_HOST_ASSERT(y_fi_sf->is_contiguous() and y_fi_sf->device() == device);
+        DG_HOST_ASSERT(hidden % static_cast<int>(mhc_layout::kHiddenPerSFWord) == 0);
+        DG_HOST_ASSERT(y_fi_sf->numel() >= ceil_div<int64_t>(num_tokens, 128) * 128 * (hidden / mhc_layout::kHiddenPerSF));
+    }
     if (y_shared_sf.has_value()) {
         check_sf(y_shared_sf.value());
         const auto num_required_rows = ceil_div<int64_t>(num_tokens, shared_sf_block_m) * align<int64_t>(shared_sf_block_m, 128);
@@ -253,7 +264,7 @@ static void mega_mhc(const torch::stable::Tensor& x,
         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
         y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
         y_fp8, y_primary_sf, y_shared_sf,
-        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
+        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, y_fi_sf);
 }
 
 } // namespace deep_gemm::mega_mhc
@@ -288,14 +299,15 @@ static void mega_mhc(
     const std::optional<torch::stable::Tensor>& y_gemm_sf,
     const std::optional<torch::stable::Tensor>& y_routed_sf,
     const std::optional<torch::stable::Tensor>& y_shared_sf,
-    const int64_t& shared_sf_block_m) {
+    const int64_t& shared_sf_block_m,
+    const std::optional<torch::stable::Tensor>& y_fi_sf) {
     mega_mhc::mega_mhc(
-        x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, hc_mult, hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale, new_residual, new_prev_mix, new_post_mix, new_comb_res_mix, y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m);
+        x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, hc_mult, hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale, new_residual, new_prev_mix, new_post_mix, new_comb_res_mix, y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m, y_fi_sf);
 }
 } // namespace deep_gemm::torch_registration
 
 STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
-    m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, int num_sinkhorn_iters, Tensor rmsnorm_weight, float rmsnorm_eps, float rmsnorm_scale, Tensor(a!) new_residual, Tensor(b!)? new_prev_mix, Tensor(c!) new_post_mix, Tensor(d!) new_comb_res_mix, Tensor(e!)? y_bf16=None, Tensor(f!)? y_fp8=None, Tensor(g!)? y_gemm_sf=None, Tensor(h!)? y_routed_sf=None, Tensor(i!)? y_shared_sf=None, int shared_sf_block_m=0) -> ()");
+    m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, int num_sinkhorn_iters, Tensor rmsnorm_weight, float rmsnorm_eps, float rmsnorm_scale, Tensor(a!) new_residual, Tensor(b!)? new_prev_mix, Tensor(c!) new_post_mix, Tensor(d!) new_comb_res_mix, Tensor(e!)? y_bf16=None, Tensor(f!)? y_fp8=None, Tensor(g!)? y_gemm_sf=None, Tensor(h!)? y_routed_sf=None, Tensor(i!)? y_shared_sf=None, int shared_sf_block_m=0, Tensor(j!)? y_fi_sf=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
