@@ -742,6 +742,38 @@ def bf16_mega_gate(
     return tuple(out)
 
 
+def bf16_mega_gate_front(
+    x,
+    weight,
+    num_topk,
+    routed_scaling_factor,
+    ep_rank,
+    bias,
+    x_fp8,
+    x_sf,
+    topk_idx,
+    topk_weights,
+    scoring_func='sqrtsoftplus',
+    shared_x_sf=None,
+    shared_block_m=0,
+    logical_topk_idx=None,
+    is_padding=None,
+    logical_to_physical=None,
+    replica_count=None,
+    expert_load=None,
+    record_enabled=None,
+    num_unpadded_tokens=None,
+):
+    """``bf16_mega_gate`` + vLLM's MegaMoE input staging (MXFP8 x, scales, EPLB map and record) in one launch.
+
+    Writes the routing (physical ids, fp32 weights) and the MXFP8 activations straight into the given MegaMoE buffer views."""
+    _torch_ops.bf16_mega_gate_front(
+        x, weight, num_topk, routed_scaling_factor, ep_rank, scoring_func, bias,
+        x_fp8, x_sf, shared_x_sf, shared_block_m, topk_idx, topk_weights, logical_topk_idx, is_padding,
+        logical_to_physical, replica_count, expert_load, record_enabled, num_unpadded_tokens,
+    )
+
+
 def get_symm_buffer_size_for_mega_moe(
     num_ranks,
     num_experts,
@@ -870,6 +902,7 @@ _PUBLIC_API = [
     'get_symm_buffer_size_for_nvfp4_mega_moe',
     'nvfp4_mega_moe',
     'bf16_mega_gate',
+    'bf16_mega_gate_front',
     # FP8/FP4 GEMMs
     'fp8_fp4_gemm_nt', 'fp8_fp4_gemm_nn',
     'fp8_fp4_gemm_tn', 'fp8_fp4_gemm_tt',

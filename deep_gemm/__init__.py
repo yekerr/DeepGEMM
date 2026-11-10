@@ -64,6 +64,7 @@ from ._C import (
     k_grouped_bf16_gemm_tn_contiguous,
     # MegaGate kernels
     bf16_mega_gate,
+    bf16_mega_gate_front,
     # Einsum kernels
     einsum,
     fp8_einsum,
