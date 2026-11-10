@@ -32,7 +32,7 @@ static void sm100_mega_mhc(
     const std::optional<torch::stable::Tensor>& y_shared_sf,
     const int& shared_sf_block_m, const float& rmsnorm_scale,
     const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms,
-    const std::optional<torch::stable::Tensor>& y_fi_sf = std::nullopt) {
+    const std::optional<torch::stable::Tensor>& y_fi_sf = std::nullopt, const bool& mosca_regs = false) {
     const bool is_shifted = shifted_prev_mix.has_value();
     // FlashInfer-format FP8 (y_fi_sf) writes E4M3 into y_fp8 and F8_128x4 UE8M0 bytes into y_fi_sf; it is not the
     // DeepGEMM FP8 output mode (kStoreFP8), which keeps its own scale layouts.
@@ -58,9 +58,9 @@ static void sm100_mega_mhc(
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        printf("Mega %s mHC: T=%d, H=%d, splits=%d, IO/Fn/A stages=%u/%u/%u, "
+        printf("Mega %s mHC: T=%d, H=%d, splits=%d, grid=%d, mosca_regs=%d, IO/Fn/A stages=%u/%u/%u, "
                "threads=%u, shared memory=%d\n",
-               is_shifted ? "shifted" : "normal", num_tokens, hidden, num_splits,
+               is_shifted ? "shifted" : "normal", num_tokens, hidden, num_splits, num_sms, static_cast<int>(mosca_regs),
                mhc_layout::kNumIOStages, mhc_layout::kNumFnStages, mhc_layout::kNumAStages,
                mhc_layout::kNumThreads, smem_size);
     }
@@ -111,7 +111,8 @@ static void sm100_mega_mhc(
         .y_shared_sf_stride_word = y_shared_sf.has_value() ? y_shared_sf->stride(1) : 0,
     };
 
-    // Compile (the FlashInfer-format FP8 flag is appended only when set, so the stock source string is unchanged)
+    // Compile (the FlashInfer-format FP8 flag and the moved register split `mosca_regs` are appended only when set, so
+    // the stock source string is unchanged)
     const auto kernel = jit->compile("sm100_mega_mhc", std::format(R"(
 #include <deep_gemm/impls/sm100_mega_mhc.cuh>
 
@@ -129,7 +130,7 @@ static void __instantiate_kernel() {{
         store_bf16,
         norm_args.y_fp8 != nullptr and not store_fi_fp8,
         shared_sf_block_m,
-        store_fi_fp8 ? std::format(", {}", store_fi_fp8) : std::string()));
+        (store_fi_fp8 or mosca_regs) ? std::format(", {}{}", store_fi_fp8, mosca_regs ? ", true" : "") : std::string()));
 
     // Launch
     jit->launch(

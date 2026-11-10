@@ -35,7 +35,8 @@ constexpr uint32_t kNumTokenRowsPerLane = 2;
 // Persistent mHC with static grid-stride roles and TMA-native layouts.
 // Norm receives one arrival only after Shifted X1 stores and statistics are committed.
 template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
-          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kFIFP8 = false>
+          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kFIFP8 = false,
+          bool kMoscaRegs = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     sm100_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_x,
@@ -61,6 +62,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
     DG_STATIC_ASSERT(not kFIFP8 or (kIsShifted and kStoreBF16 and not kStoreFP8),
                      "FlashInfer-format FP8 is a Shifted BF16 extra output");
+    // The Sinkhorn follows the register split on the bf16 path. Without the moved registers (DG_MOSCA_MHC_RULE 0, the stock
+    // rows of rules 1 / 3, and rule 3's num_m_blocks 10 / 13 bands) the shifted bf16 kernel runs DeepGEMM's own shuffle
+    // Sinkhorn, i.e. it is the upstream kernel's code; the moved registers keep the shuffle-free register-copy Sinkhorn; the
+    // FlashInfer-format FP8 path (kFIFP8) keeps it too, also in the bands. Outputs are bitwise either way.
+    constexpr bool kMoscaStockSinkhorn = kIsShifted and not kMoscaRegs and not kFIFP8;
 
     // MMA and tensor memory configs
     constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
@@ -88,9 +94,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
     // Register reconfigurations
     constexpr uint32_t kNumControlRegisters = 32;
-    constexpr uint32_t kNumPostRegisters = kIsShifted ? 136 : 112;
+    // kMoscaRegs (host rule DG_MOSCA_MHC_RULE >= 1): the shifted kernel moves 8 registers per post thread to the shifted
+    // norm worker (measured on VR200). Off = DeepGEMM's own split (136 / 96).
+    constexpr uint32_t kNumPostRegisters = kIsShifted ? (kMoscaRegs ? 128 : 136) : 112;
     constexpr uint32_t kNumLightweightRegisters = 40;
-    constexpr uint32_t kNumShiftedNormRegisters = 96;
+    constexpr uint32_t kNumShiftedNormRegisters = (kIsShifted and kMoscaRegs) ? 112 : 96;
     constexpr uint32_t kNumNormalRegisters = 80;
 
     // WG3 epilogue and WG4 Mix use the same lightweight allocation.
@@ -666,7 +674,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             }
             for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
                  token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
-                epilogue::mega_mhc::run_mix_task<kHidden, true>(
+                epilogue::mega_mhc::run_mix_task<kHidden, true, kNumSplits, kMoscaStockSinkhorn>(
                     workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
         }
     }

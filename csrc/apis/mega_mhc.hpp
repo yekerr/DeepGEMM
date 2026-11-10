@@ -16,7 +16,8 @@ namespace deep_gemm::mega_mhc {
 
 namespace mhc_layout = layout::mega_mhc;
 
-static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms) {
+static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms,
+                               const bool is_shifted = false) {
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
@@ -27,11 +28,67 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
         return static_cast<uint32_t>(pinned);
     }
 
-    // Fewest splits that still reach the shortest possible longest task
+    // Shifted kernel: when the floor of kDefaultNumSplits splits would need more tasks than one wave of the grid, take
+    // the largest split count that fits one wave (a second wave costs a whole extra task latency)
     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+    if (is_shifted and num_m_blocks * mhc_layout::kDefaultNumSplits > num_sms)
+        return cute::max(1u, cute::min(num_k_blocks, num_sms / num_m_blocks));
+
+    // Fewest splits that still reach the shortest possible longest task
     const uint32_t max_num_splits = cute::min(
         mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
     return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
+}
+
+// Measured on VR200 (212 SMs) at the DeepSeek-V4.1 decode shapes: the shifted mega mHC runs a persistent grid of 192
+// CTAs. Every other device and the normal (non-shifted) kernel keep one CTA per SM.
+// The 192-CTA grid is kept only where it does not force fewer splits than the stock split on all SMs when that stock
+// split already fits one wave. Elsewhere (num_m_blocks 5, 10 and 13 on 212 SMs, i.e. T 257-320, 577-640 and 769-832)
+// the smaller grid only lengthened every task, so one CTA per SM and the stock split are kept there (bitwise to stock:
+// same split count).
+static uint32_t get_grid_sms(const uint32_t num_sms, const bool is_shifted, const uint32_t num_m_blocks,
+                             const uint32_t hidden) {
+    if (not (is_shifted and num_sms == 212))
+        return num_sms;
+    const uint32_t stock_splits = get_num_splits(num_m_blocks, hidden, num_sms, false);
+    const uint32_t grid192_splits = get_num_splits(num_m_blocks, hidden, 192u, true);
+    if (num_m_blocks * stock_splits <= num_sms and grid192_splits < stock_splits)
+        return num_sms;
+    return 192u;
+}
+
+// Host rule switch, read per call from the environment (before any CUDA-graph capture):
+//   DG_MOSCA_MHC_RULE unset or 0: DeepGEMM's own host rule and register split (stock; the default)
+//   1: the tuned rule (192-CTA grid, one-wave split, 128 / 112 register split) ONLY where its split count equals stock's,
+//      i.e. where it cannot change an output bit (num_m_blocks <= 13 on 212 SMs); stock everywhere else
+//   2: the full tuned rule, which also lowers the split from num_m_blocks 14 up (T >= 833 on 212 SMs): outputs may differ
+//      by an ulp, so it needs an accuracy run before use
+//   3: rule 1, except in the bands where rule 1's moved registers lost on a holdout measurement (the bands of the full
+//      212-CTA grid with the stock split 20 or 16 = num_m_blocks 10 and 13, T 577-640 and 769-832): there the stock
+//      register split, so the bf16 path runs DeepGEMM's own kernel code and the FlashInfer-format FP8 path the stock split
+//      with the register-copy Sinkhorn. Bitwise wherever it fires.
+// Without the moved registers the shifted bf16 kernel is DeepGEMM's own code (the Sinkhorn follows the register split, see
+// impls/sm100_mega_mhc.cuh). The normal (non-shifted) kernel always keeps the stock host rule.
+struct MoscaMhcConfig {
+    uint32_t grid_sms;
+    uint32_t num_splits;
+    bool mosca_regs;
+};
+
+static MoscaMhcConfig get_mosca_mhc_config(const uint32_t device_sms, const bool is_shifted, const uint32_t num_m_blocks,
+                                           const uint32_t hidden) {
+    const int rule = is_shifted ? deep_jit::get_env<int>("DG_MOSCA_MHC_RULE") : 0;
+    const uint32_t stock_splits = get_num_splits(num_m_blocks, hidden, device_sms, false);
+    if (rule <= 0)
+        return {device_sms, stock_splits, false};
+    const uint32_t v3_grid = get_grid_sms(device_sms, true, num_m_blocks, hidden);
+    const uint32_t v3_splits = get_num_splits(num_m_blocks, hidden, v3_grid, true);
+    if (rule == 3 and v3_splits == stock_splits and v3_grid == device_sms and device_sms == 212 and
+        (stock_splits == 20 or stock_splits == 16))
+        return {device_sms, stock_splits, false};
+    if (rule == 2 or rule >= 4 or v3_splits == stock_splits)
+        return {v3_grid, v3_splits, true};
+    return {device_sms, stock_splits, false};
 }
 
 static const torch::stable::Tensor& get_split_barriers(const torch::stable::Tensor& reference) {
@@ -241,9 +298,11 @@ static void mega_mhc(const torch::stable::Tensor& x,
     }
 
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
-    const auto num_sms = runtime->get_num_sms();
     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
-    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms));
+    const auto mosca_cfg = get_mosca_mhc_config(static_cast<uint32_t>(runtime->get_num_sms()), is_shifted, num_m_blocks,
+                                                static_cast<uint32_t>(hidden));
+    const auto num_sms = static_cast<int>(mosca_cfg.grid_sms);
+    const auto num_splits = mosca_cfg.num_splits;
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
@@ -271,7 +330,7 @@ static void mega_mhc(const torch::stable::Tensor& x,
         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
         y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
         y_fp8, y_primary_sf, y_shared_sf,
-        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, y_fi_sf);
+        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, y_fi_sf, mosca_cfg.mosca_regs);
 }
 
 } // namespace deep_gemm::mega_mhc

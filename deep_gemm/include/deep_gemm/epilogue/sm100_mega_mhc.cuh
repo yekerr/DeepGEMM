@@ -13,7 +13,7 @@ namespace deep_gemm::epilogue::mega_mhc {
 using namespace layout::mega_mhc;
 
 // Reduce one token's split partials and produce its Mix coefficients.
-template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits>
+template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits, bool kStockSinkhorn = false>
 CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
                                   const MixArgs& mix_args,
                                   const uint32_t& token_idx, const uint32_t& lane_idx) {
@@ -60,32 +60,88 @@ CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64
     }
     __syncwarp();
 
-    const auto sinkhorn_normalize = [&](float value) {
-        // Comb logits occupy a row-major route x route region after Pre and Post.
-        value = is_comb_lane ? value : 0.0f;
-        const float row_max = math::warp_reduce_max<kNumRoutes>(value);
-        value = __expf(value - row_max);
-        float row_sum = math::warp_reduce_sum<kNumRoutes>(value);
-        value = value * math::fast_rcp(row_sum) + mix_args.sinkhorn_eps;
+    float normalized_comb;
+    if constexpr (kStockSinkhorn) {
+        const auto sinkhorn_normalize = [&](float value) {
+            // Comb logits occupy a row-major route x route region after Pre and Post.
+            value = is_comb_lane ? value : 0.0f;
+            const float row_max = math::warp_reduce_max<kNumRoutes>(value);
+            value = __expf(value - row_max);
+            float row_sum = math::warp_reduce_sum<kNumRoutes>(value);
+            value = value * math::fast_rcp(row_sum) + mix_args.sinkhorn_eps;
 
-        const auto get_col_sum = [](const float& element) {
-            // For four routes, these XORs combine adjacent rows, then the two row pairs.
-            float sum = element + __shfl_xor_sync(0xffffffff, element, kNumRoutes);
-            sum += __shfl_xor_sync(0xffffffff, sum, 6 * kNumRoutes);
-            return sum;
+            const auto get_col_sum = [](const float& element) {
+                // For four routes, these XORs combine adjacent rows, then the two row pairs.
+                float sum = element + __shfl_xor_sync(0xffffffff, element, kNumRoutes);
+                sum += __shfl_xor_sync(0xffffffff, sum, 6 * kNumRoutes);
+                return sum;
+            };
+
+            value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
+            #pragma unroll 1
+            for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
+                row_sum = math::warp_reduce_sum<kNumRoutes>(value);
+                value *= math::fast_rcp(row_sum + mix_args.sinkhorn_eps);
+                value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
+            }
+            return value;
         };
 
-        value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
+        normalized_comb = sinkhorn_normalize(mix_value);
+
+    } else {
+        // Sinkhorn over the comb logits: the arithmetic of the former shuffle version (row softmax + eps, then
+        // num_sinkhorn_iters - 1 rounds of row and column normalization, rcp.approx throughout), run on a register copy of the 4x4 block held by every
+        // lane, so the serial iterations need no shuffles. Every value sees the same operations in the same association:
+        // rows reduce as (c0 + c2) + (c1 + c3) (warp_reduce_sum<4>: xor 2, then xor 1), columns as (r0 + r1) + (r2 + r3)
+        // (get_col_sum: xor 4, then xor 24). Outputs are bitwise those of sinkhorn_normalize.
+        float comb_block[kNumRoutes * kNumRoutes];
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumRoutes * kNumRoutes; ++ i)
+            comb_block[i] = __shfl_sync(0xffffffff, mix_value, kFirstCombLane + i);
+        #pragma unroll
+        for (uint32_t r = 0; r < kNumRoutes; ++ r) {
+            float* row = comb_block + r * kNumRoutes;
+            const float row_max = fmaxf(fmaxf(row[0], row[2]), fmaxf(row[1], row[3]));
+            #pragma unroll
+            for (uint32_t c = 0; c < kNumRoutes; ++ c)
+                row[c] = __expf(row[c] - row_max);
+            const float row_rcp = math::fast_rcp((row[0] + row[2]) + (row[1] + row[3]));
+            #pragma unroll
+            for (uint32_t c = 0; c < kNumRoutes; ++ c)
+                row[c] = row[c] * row_rcp + mix_args.sinkhorn_eps;
+        }
+        const auto normalize_cols = [&]() {
+            #pragma unroll
+            for (uint32_t c = 0; c < kNumRoutes; ++ c) {
+                const float col_rcp = math::fast_rcp(((comb_block[c] + comb_block[kNumRoutes + c]) +
+                                                      (comb_block[2 * kNumRoutes + c] + comb_block[3 * kNumRoutes + c])) +
+                                                     mix_args.sinkhorn_eps);
+                #pragma unroll
+                for (uint32_t r = 0; r < kNumRoutes; ++ r)
+                    comb_block[r * kNumRoutes + c] *= col_rcp;
+            }
+        };
+        normalize_cols();
         #pragma unroll 1
         for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
-            row_sum = math::warp_reduce_sum<kNumRoutes>(value);
-            value *= math::fast_rcp(row_sum + mix_args.sinkhorn_eps);
-            value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
+            #pragma unroll
+            for (uint32_t r = 0; r < kNumRoutes; ++ r) {
+                float* row = comb_block + r * kNumRoutes;
+                const float row_rcp = math::fast_rcp(((row[0] + row[2]) + (row[1] + row[3])) + mix_args.sinkhorn_eps);
+                #pragma unroll
+                for (uint32_t c = 0; c < kNumRoutes; ++ c)
+                    row[c] *= row_rcp;
+            }
+            normalize_cols();
         }
-        return value;
-    };
+        // Each comb lane keeps its own element (a select chain keeps the block in registers).
+        normalized_comb = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumRoutes * kNumRoutes; ++ i)
+            normalized_comb = lane_idx == kFirstCombLane + i ? comb_block[i] : normalized_comb;
 
-    const float normalized_comb = sinkhorn_normalize(mix_value);
+    }
 
     // Only Shifted stores the new Pre coefficients.
     if (is_hc_output_lane and (kIsShifted or not is_pre_lane)) {
