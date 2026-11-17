@@ -65,6 +65,7 @@ from ._C import (
     # MegaGate kernels
     bf16_mega_gate,
     bf16_mega_gate_front,
+    bf16_mega_gate_front2,
     # Einsum kernels
     einsum,
     fp8_einsum,

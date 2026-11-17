@@ -774,6 +774,43 @@ def bf16_mega_gate_front(
     )
 
 
+def bf16_mega_gate_front2(
+    x,
+    weight,
+    num_topk,
+    routed_scaling_factor,
+    ep_rank,
+    bias,
+    x_q,
+    x_sf,
+    topk_idx,
+    topk_weights,
+    scoring_func='sqrtsoftplus',
+    image_bias=None,
+    image_token_mask=None,
+    format=0,
+    norm_const=1.0,
+    scale_multiplier=1.0 / 6.0,
+    is_padding=None,
+    logical_to_physical=None,
+    replica_count=None,
+    expert_load=None,
+    record_enabled=None,
+    num_unpadded_tokens=None,
+    xs_q=None,
+    xs_sf=None,
+):
+    """FRONT2: ``bf16_mega_gate`` + the router's EPLB map / record + the official gen-phase entry's NVFP4 staging in one launch.
+
+    Writes the activation / scale planes (uint8 views, plain rows) and the route planes (int32 physical ids with -1 over the
+    capacity tail, fp32 scores) of the official cutedsl_megamoe gen-phase kernel."""
+    _torch_ops.bf16_mega_gate_front2(
+        x, weight, num_topk, routed_scaling_factor, ep_rank, scoring_func, bias, image_bias, image_token_mask, format,
+        x_q, x_sf, norm_const, scale_multiplier, xs_q, xs_sf, topk_idx, topk_weights, is_padding, logical_to_physical, replica_count,
+        expert_load, record_enabled, num_unpadded_tokens,
+    )
+
+
 def get_symm_buffer_size_for_mega_moe(
     num_ranks,
     num_experts,
@@ -903,6 +940,7 @@ _PUBLIC_API = [
     'nvfp4_mega_moe',
     'bf16_mega_gate',
     'bf16_mega_gate_front',
+    'bf16_mega_gate_front2',
     # FP8/FP4 GEMMs
     'fp8_fp4_gemm_nt', 'fp8_fp4_gemm_nn',
     'fp8_fp4_gemm_tn', 'fp8_fp4_gemm_tt',

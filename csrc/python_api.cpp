@@ -21,6 +21,7 @@
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
 #include "apis/mega_gate_front.hpp"
+#include "apis/mega_gate_front2.hpp"
 
 namespace deep_gemm {
 static void ensure_jit() { (void)jit.get(); }
