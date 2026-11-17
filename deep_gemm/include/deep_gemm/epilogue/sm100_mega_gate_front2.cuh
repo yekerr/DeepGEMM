@@ -87,10 +87,11 @@ CUTLASS_DEVICE uint32_t e2m1x8(const float* q) {
     return r;
 }
 
-// ---- the shared expert's MXFP8 input: FlashInfer's CuTe DSL `mxfp8_quantize` (swizzled 128x4) instruction for instruction:
+// ---- the shared expert's MXFP8 input: FlashInfer's shared-expert staging (`quantize_mxfp8_block32` + `to_blocked`, 128x4):
 // amax = max.bf16x2 tree of (word & 0x7fff7fff), then max.f32 of the two bf16 halves and of the two 16-element halves;
-// e = ceil-ue8m0(mul.f32(amax, 1 / 448)) (its exact bit construction); inv = 2^(127 - e) (0 for e == 0);
-// byte = cvt.rn.satfinite.e4m3x2.f32 of max.f32(min.f32(mul.f32(x, inv), 448), -448)
+// e = ceil-ue8m0(max.f32(mul.f32(amax, 1 / 448), 2^-126)) (its exact bit construction; zero and tiny blocks get e = 1, the
+// floor of FlashInfer's `_ceil_log2_exponent`); inv = 2^(127 - e) = 1 / scale exactly;
+// byte = cvt.rn.satfinite.e4m3x2.f32 of max.f32(min.f32(mul.f32(x, inv), 448), -448) (= e4m3(x / scale), |x / scale| <= 448)
 CUTLASS_DEVICE uint32_t bf16x2_max(const uint32_t& a, const uint32_t& b) {
     uint32_t r;
     asm("max.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
@@ -158,7 +159,7 @@ CUTLASS_DEVICE uint32_t sf_index_swizzled_128x4(const uint32_t& row, const uint3
 CUTLASS_DEVICE void stage_shared_mxfp8_block(const Front2Args& args, const uint32_t& token_idx, const uint32_t& col_block,
                                              const uint32_t* words) {
     const float amax = f32_max(bf16x8_max_abs(words), bf16x8_max_abs(words + 8));
-    const uint32_t e = float_to_ue8m0_fast(f32_mul(amax, __uint_as_float(0x3b124925u)));
+    const uint32_t e = float_to_ue8m0_fast(f32_max(f32_mul(amax, __uint_as_float(0x3b124925u)), __uint_as_float(0x00800000u)));
     const float inv = ue8m0_to_inv_scale_fast(e);
     uint32_t packed[8];
     #pragma unroll
@@ -373,7 +374,8 @@ CUTLASS_DEVICE void store_front2_token(const RoutingArgs& routing_args, const Fr
 }
 
 // FlashInfer's fused tail mask: rows [num_tokens, route_capacity) of the id plane route nowhere (-1); with X_s, the scale rows
-// [num_tokens, padded) of its swizzled plane are zero (mxfp8_quantize's padding-row path)
+// [num_tokens, padded) of its swizzled plane are zero (FlashInfer's shared staging clears those rows; its data rows are cleared by
+// FlashInfer's stage_external)
 template <uint32_t kNumTopk, uint32_t kNumGateThreads, bool kWithSharedX>
 CUTLASS_DEVICE void mask_route_tail(const Front2Args& args, const uint32_t& num_tokens, const uint32_t& gate_thread_idx) {
     if (args.route_capacity > num_tokens) {

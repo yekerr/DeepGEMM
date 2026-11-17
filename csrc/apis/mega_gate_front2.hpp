@@ -39,8 +39,8 @@ namespace deep_gemm::mega_gate {
  *     x_sf                  [>=T,>=H/16]   uint8 view of the scale plane, out (NVFP4; MXFP8: [>=T,>=H/32]) (column stride 1)
  *     norm_const, scale_multiplier: the entry's offline NVFP4 normalization (`offline_norm_const`, `offline_scale_multiplier`;
  *                                   unused by MXFP8)
- *     xs_q                  [>=T,>=H]      uint8, out, optional: the fused shared expert's MXFP8 input (FlashInfer's swizzled
- *                                          `mxfp8_quantize`, bit for bit)                                                } together
+ *     xs_q                  [>=T,>=H]      uint8, out, optional: the fused shared expert's MXFP8 input (FlashInfer's shared
+ *                                          staging `quantize_mxfp8_block32` + `to_blocked`, bit for bit)                 } together
  *     xs_sf                 [>=P*S]        uint8, out, optional: its UE8M0 scales, 128x4 swizzled, P = ceil(T / 128) * 128 rows, }
  *                                          S = ceil(H / 128) * 4 columns; rows [T, P) zero
  *     topk_idx              [C,K]          int32, out: physical ids (-1 for padding), rows [T, C) set to -1 (C >= T)
