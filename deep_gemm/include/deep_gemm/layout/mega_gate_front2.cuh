@@ -27,8 +27,8 @@ struct Front2Args {
     float norm_const, scale_multiplier;
 
     // The fused shared expert's input X_s (nullptr: off): MXFP8 e4m3 [T, H] (row stride in bytes) and UE8M0 scales in the 128x4
-    // swizzled (blocked) layout of `xs_sf_padded_rows` x `xs_sf_padded_cols`, rows [T, padded) zero: FlashInfer's
-    // `mxfp8_quantize(x, is_sf_swizzled_layout=True)` (the served MXFP8 activation quant), bit for bit
+    // swizzled (blocked) layout of `xs_sf_padded_rows` x `xs_sf_padded_cols`, rows [T, padded) zero: FlashInfer's shared-expert
+    // staging (`quantize_mxfp8_block32` + `to_blocked`), bit for bit
     uint8_t* xs_q;
     uint8_t* xs_sf;
     int64_t xs_q_stride_m;
