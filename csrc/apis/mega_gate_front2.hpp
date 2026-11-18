@@ -51,6 +51,11 @@ namespace deep_gemm::mega_gate {
  *     expert_load           [P]            int32, in/out             }
  *     record_enabled        []             bool                      }
  *     num_unpadded_tokens   []             int32, optional
+ *     staging_rule          int            whose unfused chain the planes reproduce bit for bit (`Front2Rule`): 0 (default) =
+ *                                          FlashInfer fused_quant_stage / DataPreprocess + its shared staging; 1 = the SM107
+ *                                          NVFP4 runtime's Triton staging (stage_nvfp4_mxfp8; format 0 only): padded and tail
+ *                                          rows score 0, X_s scale rows [T, P) untouched, its div.full arithmetic.
+ *                                          With rule 1, topk_weights needs C rows (the tail is written).
  */
 static void bf16_mega_gate_front2(const torch::stable::Tensor& x,
                                   const torch::stable::Tensor& weight,
@@ -75,13 +80,17 @@ static void bf16_mega_gate_front2(const torch::stable::Tensor& x,
                                   const std::optional<torch::stable::Tensor>& replica_count,
                                   const std::optional<torch::stable::Tensor>& expert_load,
                                   const std::optional<torch::stable::Tensor>& record_enabled,
-                                  const std::optional<torch::stable::Tensor>& num_unpadded_tokens) {
+                                  const std::optional<torch::stable::Tensor>& num_unpadded_tokens,
+                                  const int& staging_rule) {
     constexpr int kNumMaxRoutedExperts = 512, kNumMaxTopk = 32;
     const auto [num_tokens, hidden] = get_shape<2>(x);
     const auto num_routed_experts = static_cast<int>(weight.size(0));
     const bool has_image = image_bias.has_value();
     const bool is_mxfp8 = format == static_cast<int>(mega_gate_layout::Front2Format::kMxfp8);
     DG_HOST_ASSERT(format == static_cast<int>(mega_gate_layout::Front2Format::kNvfp4) or is_mxfp8);
+    const bool is_triton_rule = staging_rule == static_cast<int>(mega_gate_layout::Front2Rule::kSm107Triton);
+    DG_HOST_ASSERT(staging_rule == static_cast<int>(mega_gate_layout::Front2Rule::kDataPreprocess) or is_triton_rule);
+    DG_HOST_ASSERT(not (is_triton_rule and is_mxfp8));
     DG_HOST_ASSERT(hidden > 0 and hidden % 1024 == 0);
     DG_HOST_ASSERT(num_routed_experts <= kNumMaxRoutedExperts and
                    num_routed_experts % static_cast<int>(mega_gate_layout::kNumExpertsPerLaneVector) == 0);
@@ -126,7 +135,7 @@ static void bf16_mega_gate_front2(const torch::stable::Tensor& x,
     }
     check_plane(topk_idx, num_tokens, num_topk, torch::headeronly::ScalarType::Int);
     DG_HOST_ASSERT(topk_idx.size(1) == num_topk);
-    check_plane(topk_weights, num_tokens, num_topk, torch::headeronly::ScalarType::Float);
+    check_plane(topk_weights, is_triton_rule ? topk_idx.size(0) : num_tokens, num_topk, torch::headeronly::ScalarType::Float);
     DG_HOST_ASSERT(topk_weights.size(1) == num_topk);
     if (is_padding.has_value()) {
         DG_HOST_ASSERT(is_padding->dim() == 1 and is_padding->size(0) >= num_tokens);
@@ -198,7 +207,7 @@ static void bf16_mega_gate_front2(const torch::stable::Tensor& x,
         .num_physical = static_cast<uint32_t>(num_physical),
     };
     sm100_bf16_mega_gate_front2(x, weight, bias, image_bias, image_token_mask, routing_args, front_args,
-                                format, has_eplb, is_padding.has_value(), with_shared_x,
+                                format, has_eplb, is_padding.has_value(), with_shared_x, staging_rule,
                                 get_score_barriers(x), num_tokens, hidden, num_routed_experts, num_topk);
 }
 
@@ -230,12 +239,13 @@ static void bf16_mega_gate_front2(const torch::stable::Tensor& x,
                                   const std::optional<torch::stable::Tensor>& replica_count,
                                   const std::optional<torch::stable::Tensor>& expert_load,
                                   const std::optional<torch::stable::Tensor>& record_enabled,
-                                  const std::optional<torch::stable::Tensor>& num_unpadded_tokens) {
+                                  const std::optional<torch::stable::Tensor>& num_unpadded_tokens,
+                                  const int64_t& staging_rule) {
     // The f32 multipliers are passed through f64 by the schema; the caller hands the f32 value, so the round trip is exact
     mega_gate::bf16_mega_gate_front2(x, weight, static_cast<int>(num_topk), static_cast<float>(routed_scaling_factor),
         static_cast<int>(ep_rank), scoring_func, bias, image_bias, image_token_mask, static_cast<int>(format), x_q, x_sf,
         static_cast<float>(norm_const), static_cast<float>(scale_multiplier), xs_q, xs_sf, topk_idx, topk_weights, is_padding,
-        logical_to_physical, replica_count, expert_load, record_enabled, num_unpadded_tokens);
+        logical_to_physical, replica_count, expert_load, record_enabled, num_unpadded_tokens, static_cast<int>(staging_rule));
 }
 } // namespace deep_gemm::torch_registration
 
@@ -244,7 +254,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
           "Tensor bias, Tensor? image_bias, Tensor? image_token_mask, int format, Tensor(a!) x_q, Tensor(b!) x_sf, "
           "float norm_const, float scale_multiplier, Tensor(f!)? xs_q, Tensor(g!)? xs_sf, Tensor(c!) topk_idx, Tensor(d!) topk_weights, Tensor? is_padding, "
           "Tensor? logical_to_physical, Tensor? replica_count, Tensor(e!)? expert_load, Tensor? record_enabled, "
-          "Tensor? num_unpadded_tokens) -> ()");
+          "Tensor? num_unpadded_tokens, int staging_rule=0) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {

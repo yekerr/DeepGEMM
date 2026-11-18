@@ -25,6 +25,7 @@ static void sm100_bf16_mega_gate_front2(const torch::stable::Tensor& x, const to
                                         const mega_gate_layout::RoutingArgs& routing_args,
                                         const mega_gate_layout::Front2Args& front_args,
                                         const int& format, const bool& has_eplb, const bool& has_padding, const bool& with_shared_x,
+                                        const int& staging_rule,
                                        const torch::stable::Tensor& score_barriers,
                                        const int& num_tokens, const int& hidden,
                                        const int& num_routed_experts, const int& num_topk) {
@@ -60,7 +61,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {},
-        {}u, {}, {}, {}
+        {}u, {}, {}, {}, {}u
     >);
 }};
 )",
@@ -69,7 +70,7 @@ static void __instantiate_kernel() {{
         config.num_mma_ctas, config.num_split_k, config.num_expert_groups,
         num_topk,
         num_routed_experts != num_aligned_experts, has_image,
-        format, has_eplb, has_padding, with_shared_x));
+        format, has_eplb, has_padding, with_shared_x, staging_rule));
 
     // Launch: the same grid / block / cluster / SMEM as the stock gate. PDL follows DeepGEMM's global `set_pdl` (vLLM turns
     // it on for SM90+), and the kernel triggers its dependents right after its prologue.

@@ -51,6 +51,12 @@ CUTLASS_DEVICE float f32_mul(const float& a, const float& b) {
     asm("mul.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
     return r;
 }
+// Triton's lowering of an f32 `/` (rule kSm107Triton)
+CUTLASS_DEVICE float f32_div_full(const float& a, const float& b) {
+    float r;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
 CUTLASS_DEVICE float f32_rcp_approx_ftz(const float& a) {
     float r;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
@@ -155,11 +161,17 @@ CUTLASS_DEVICE uint32_t bf16x2_to_e4m3x2_scaled(const uint32_t& w, const float& 
 CUTLASS_DEVICE uint32_t sf_index_swizzled_128x4(const uint32_t& row, const uint32_t& col, const uint32_t& padded_cols) {
     return (col % 4) + (col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 + (row / 128) * 128 * padded_cols;
 }
-// One 32-column MXFP8 block of X_s from the lane's 16 bf16 words (the same registers the NVFP4 staging read)
+// One 32-column MXFP8 block of X_s from the lane's 16 bf16 words (the same registers the NVFP4 staging read).
+// Rule kSm107Triton (the SM107 runtime's Triton staging, from its sm_100 PTX): y = div.full.f32(max.f32(amax, 1e-30), 448), e = its
+// biased exponent + (mantissa != 0) (y is normal, so float_to_ue8m0_fast is exactly that), inv = 2^(127 - e); the data bytes as above
+template <Front2Rule kRule>
 CUTLASS_DEVICE void stage_shared_mxfp8_block(const Front2Args& args, const uint32_t& token_idx, const uint32_t& col_block,
                                              const uint32_t* words) {
     const float amax = f32_max(bf16x8_max_abs(words), bf16x8_max_abs(words + 8));
-    const uint32_t e = float_to_ue8m0_fast(f32_max(f32_mul(amax, __uint_as_float(0x3b124925u)), __uint_as_float(0x00800000u)));
+    const float y = kRule == Front2Rule::kSm107Triton ?
+        f32_div_full(f32_max(amax, __uint_as_float(0x0da24260u)), __uint_as_float(0x43e00000u)) :
+        f32_max(f32_mul(amax, __uint_as_float(0x3b124925u)), __uint_as_float(0x00800000u));
+    const uint32_t e = float_to_ue8m0_fast(y);
     const float inv = ue8m0_to_inv_scale_fast(e);
     uint32_t packed[8];
     #pragma unroll
@@ -226,7 +238,7 @@ CUTLASS_DEVICE uint32_t routed_mxfp8_block(const uint32_t* words, uint32_t (&pac
 
 // One 1024-column segment of MXFP8 staging by a whole warp: lane l owns columns 32l .. 32l + 31 = one UE8M0 block: a 64-byte load,
 // two 16-byte data stores, one scale byte (plain row); X_s (the fused shared expert's swizzled MXFP8) from the same registers
-template <bool kWithSharedX>
+template <bool kWithSharedX, Front2Rule kRule>
 CUTLASS_DEVICE void stage_mxfp8_segment_1024(const Front2Args& args, const uint32_t& token_idx, const uint32_t& seg_idx,
                                              const uint32_t& lane_idx) {
     const auto src = reinterpret_cast<const uint4*>(args.x + token_idx * args.x_stride_m + seg_idx * 1024 + lane_idx * 32);
@@ -242,10 +254,13 @@ CUTLASS_DEVICE void stage_mxfp8_segment_1024(const Front2Args& args, const uint3
     dst[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
     args.x_sf[token_idx * args.x_sf_stride_m + seg_idx * 32 + lane_idx] = static_cast<uint8_t>(sf);
     if constexpr (kWithSharedX)
-        stage_shared_mxfp8_block(args, token_idx, seg_idx * 32 + lane_idx, words);
+        stage_shared_mxfp8_block<kRule>(args, token_idx, seg_idx * 32 + lane_idx, words);
 }
 
-// One NVFP4 16-column block: returns the E4M3 scale byte, writes the 8 data bytes as two words
+// One NVFP4 16-column block: returns the E4M3 scale byte, writes the 8 data bytes as two words.
+// Rule kSm107Triton: the same scale byte (its min(., 448) before the satfinite cvt is the same value); the data multiplier is
+// div.full.f32(norm, sf32) where sf32 > 0, else 0 (the Triton staging's `where(sf > 0, norm / sf, 0)`)
+template <Front2Rule kRule>
 CUTLASS_DEVICE uint32_t nvfp4_block(const float (&v)[16], const float& norm_const, const float& scale_multiplier,
                                     uint32_t& w0, uint32_t& w1) {
     float amax = 0.0f;
@@ -254,8 +269,12 @@ CUTLASS_DEVICE uint32_t nvfp4_block(const float (&v)[16], const float& norm_cons
         amax = f32_max(amax, f32_abs(v[i]));
     const uint32_t sf = e4m3_byte(f32_mul(scale_multiplier, amax));
     const float sf32 = f32_from_e4m3_byte(sf);
-    const float acc = f32_mul(f32_min(f32_mul(norm_const, f32_rcp_approx_ftz(sf32)), __uint_as_float(0x7f7fffffu)),
-                              f32_min(f32_mul(sf32, __uint_as_float(0x7149f2cau)), 1.0f));
+    float acc;
+    if constexpr (kRule == Front2Rule::kSm107Triton)
+        acc = sf32 > 0.0f ? f32_div_full(norm_const, sf32) : 0.0f;
+    else
+        acc = f32_mul(f32_min(f32_mul(norm_const, f32_rcp_approx_ftz(sf32)), __uint_as_float(0x7f7fffffu)),
+                      f32_min(f32_mul(sf32, __uint_as_float(0x7149f2cau)), 1.0f));
     float q[16];
     #pragma unroll
     for (uint32_t i = 0; i < 16; ++ i)
@@ -267,7 +286,7 @@ CUTLASS_DEVICE uint32_t nvfp4_block(const float (&v)[16], const float& norm_cons
 
 // One 1024-column segment of NVFP4 staging by a whole warp: lane l owns columns 32l .. 32l + 31 (two 16-column blocks): a 64-byte
 // load, one 16-byte data store, one 2-byte scale store
-template <bool kWithSharedX>
+template <bool kWithSharedX, Front2Rule kRule>
 CUTLASS_DEVICE void stage_nvfp4_segment_1024(const Front2Args& args, const uint32_t& token_idx, const uint32_t& seg_idx,
                                              const uint32_t& lane_idx) {
     const auto src = reinterpret_cast<const uint4*>(args.x + token_idx * args.x_stride_m + seg_idx * 1024 + lane_idx * 32);
@@ -285,31 +304,33 @@ CUTLASS_DEVICE void stage_nvfp4_segment_1024(const Front2Args& args, const uint3
         v1[2 * w + 1] = f32_from_bf16(static_cast<uint16_t>(words[8 + w] >> 16));
     }
     uint32_t d[4];
-    const uint32_t sf0 = nvfp4_block(v0, args.norm_const, args.scale_multiplier, d[0], d[1]);
-    const uint32_t sf1 = nvfp4_block(v1, args.norm_const, args.scale_multiplier, d[2], d[3]);
+    const uint32_t sf0 = nvfp4_block<kRule>(v0, args.norm_const, args.scale_multiplier, d[0], d[1]);
+    const uint32_t sf1 = nvfp4_block<kRule>(v1, args.norm_const, args.scale_multiplier, d[2], d[3]);
     *reinterpret_cast<uint4*>(args.x_q + token_idx * args.x_q_stride_m + seg_idx * 512 + lane_idx * 16) = make_uint4(d[0], d[1], d[2], d[3]);
     *reinterpret_cast<uint16_t*>(args.x_sf + token_idx * args.x_sf_stride_m + seg_idx * 64 + lane_idx * 2) =
         static_cast<uint16_t>(sf0 | (sf1 << 8));
     // The lane's 32 columns are exactly one MXFP8 scale block of the shared expert's input
     if constexpr (kWithSharedX)
-        stage_shared_mxfp8_block(args, token_idx, seg_idx * 32 + lane_idx, words);
+        stage_shared_mxfp8_block<kRule>(args, token_idx, seg_idx * 32 + lane_idx, words);
 }
 
 // Staging of rows [token_begin, token_end) by the gate warps of one logical CTA: (token, 1024-column segment) units dealt over the
 // worker group's logical CTAs, then over the CTA's gate warps
-template <uint32_t kHidden, uint32_t kNumGateWarps, uint32_t kNumLogicalCtas, Front2Format kFormat, bool kWithSharedX>
+template <uint32_t kHidden, uint32_t kNumGateWarps, uint32_t kNumLogicalCtas, Front2Format kFormat, bool kWithSharedX,
+          Front2Rule kRule>
 CUTLASS_DEVICE void stage_front2(const Front2Args& args, const uint32_t& token_begin, const uint32_t& token_end,
                                  const uint32_t& logical_cta_rank, const uint32_t& gate_warp_idx, const uint32_t& lane_idx) {
     DG_STATIC_ASSERT(kFormat == Front2Format::kNvfp4 or kFormat == Front2Format::kMxfp8, "Unknown FRONT2 staging format");
     DG_STATIC_ASSERT(kHidden % 1024 == 0, "FRONT2 staging works in 1024-column segments");
+    DG_STATIC_ASSERT(kRule == Front2Rule::kDataPreprocess or kFormat == Front2Format::kNvfp4, "Rule kSm107Triton stages NVFP4 only");
     constexpr uint32_t kUnitStride = kNumGateWarps * kNumLogicalCtas;
     constexpr uint32_t kNumSegments = kHidden / 1024;
     const uint32_t num_units = (token_end - token_begin) * kNumSegments;
     for (uint32_t unit_idx = logical_cta_rank + gate_warp_idx * kNumLogicalCtas; unit_idx < num_units; unit_idx += kUnitStride) {
         if constexpr (kFormat == Front2Format::kMxfp8)
-            stage_mxfp8_segment_1024<kWithSharedX>(args, token_begin + unit_idx / kNumSegments, unit_idx % kNumSegments, lane_idx);
+            stage_mxfp8_segment_1024<kWithSharedX, kRule>(args, token_begin + unit_idx / kNumSegments, unit_idx % kNumSegments, lane_idx);
         else
-            stage_nvfp4_segment_1024<kWithSharedX>(args, token_begin + unit_idx / kNumSegments, unit_idx % kNumSegments, lane_idx);
+            stage_nvfp4_segment_1024<kWithSharedX, kRule>(args, token_begin + unit_idx / kNumSegments, unit_idx % kNumSegments, lane_idx);
     }
 }
 
@@ -331,7 +352,8 @@ CUTLASS_DEVICE void fill_eplb_cache(const Front2Args& args, uint8_t* metadata_ca
 
 // The stock `store_topk_token` weights (verbatim, so they keep their bits), then the router's EPLB map + record and the official
 // entry's route repack: int32 physical ids (-1 for padding / unmapped), fp32 scores, into the official planes.
-template <uint32_t kNumRoutedExperts, uint32_t kNumTopk, bool kHasImageBias, bool kHasEplb, bool kHasPadding>
+// Rule kSm107Triton: a padded token's scores are 0 (its ids are -1 under both rules).
+template <uint32_t kNumRoutedExperts, uint32_t kNumTopk, bool kHasImageBias, bool kHasEplb, bool kHasPadding, Front2Rule kRule>
 CUTLASS_DEVICE void store_front2_token(const RoutingArgs& routing_args, const Front2Args& args, const uint8_t* metadata_cache_bytes,
                                        const bool& record_on, const uint32_t& num_unpadded,
                                        const uint32_t& global_token_idx, const uint32_t& lane_idx,
@@ -370,20 +392,26 @@ CUTLASS_DEVICE void store_front2_token(const RoutingArgs& routing_args, const Fr
             atomicAdd(args.expert_load + physical_expert_idx, 1);
     }
     args.topk_idx_out[global_token_idx * args.topk_idx_stride_m + lane_idx] = static_cast<int32_t>(physical_expert_idx);
-    args.topk_weights_out[global_token_idx * args.topk_weights_stride_m + lane_idx] = selected_weight;
+    float stored_weight = selected_weight;
+    if constexpr (kRule == Front2Rule::kSm107Triton)
+        stored_weight = is_padding ? 0.0f : selected_weight;
+    args.topk_weights_out[global_token_idx * args.topk_weights_stride_m + lane_idx] = stored_weight;
 }
 
 // FlashInfer's fused tail mask: rows [num_tokens, route_capacity) of the id plane route nowhere (-1); with X_s, the scale rows
 // [num_tokens, padded) of its swizzled plane are zero (FlashInfer's shared staging clears those rows; its data rows are cleared by
-// FlashInfer's stage_external)
-template <uint32_t kNumTopk, uint32_t kNumGateThreads, bool kWithSharedX>
+// FlashInfer's stage_external). Rule kSm107Triton: the tail rows' scores are 0 as well, and the X_s scale rows are left as they are
+template <uint32_t kNumTopk, uint32_t kNumGateThreads, bool kWithSharedX, Front2Rule kRule>
 CUTLASS_DEVICE void mask_route_tail(const Front2Args& args, const uint32_t& num_tokens, const uint32_t& gate_thread_idx) {
     if (args.route_capacity > num_tokens) {
         const uint32_t num_slots = (args.route_capacity - num_tokens) * kNumTopk;
-        for (uint32_t i = gate_thread_idx; i < num_slots; i += kNumGateThreads)
+        for (uint32_t i = gate_thread_idx; i < num_slots; i += kNumGateThreads) {
             args.topk_idx_out[(num_tokens + i / kNumTopk) * args.topk_idx_stride_m + i % kNumTopk] = -1;
+            if constexpr (kRule == Front2Rule::kSm107Triton)
+                args.topk_weights_out[(num_tokens + i / kNumTopk) * args.topk_weights_stride_m + i % kNumTopk] = 0.0f;
+        }
     }
-    if constexpr (kWithSharedX) {
+    if constexpr (kWithSharedX and kRule == Front2Rule::kDataPreprocess) {
         if (args.xs_sf_padded_rows > num_tokens) {
             const uint32_t num_sf = (args.xs_sf_padded_rows - num_tokens) * args.xs_sf_padded_cols;
             for (uint32_t i = gate_thread_idx; i < num_sf; i += kNumGateThreads)

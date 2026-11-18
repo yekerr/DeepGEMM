@@ -29,8 +29,8 @@ template <uint32_t SHAPE_K, uint32_t kNumRoutedExperts,
           uint32_t kNumMmaCtas, uint32_t kNumSplitK, uint32_t kNumExpertGroups,
           uint32_t kNumTopk,
           bool kHasPaddedExperts, bool kHasImageTokenMask,
-          // FRONT2: the official entry's staging format and the router's EPLB / padding
-          uint32_t kFormat, bool kHasEplb, bool kHasPadding, bool kWithSharedX>
+          // FRONT2: the official entry's staging format and the router's EPLB / padding; the staging rule (whose chain it reproduces)
+          uint32_t kFormat, bool kHasEplb, bool kHasPadding, bool kWithSharedX, uint32_t kRule = 0>
 CUTLASS_GLOBAL void __launch_bounds__(mega_gate_layout::kNumNonEpilogueThreads + kNumGateThreads, 1)
 sm100_bf16_mega_gate_front2_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_x,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_weight,
@@ -46,6 +46,7 @@ sm100_bf16_mega_gate_front2_impl(const __grid_constant__ cute::TmaDescriptor ten
     constexpr bool kHasBias = true, kHasMask = false, kHasFixRoutingMask = false, kHasForceRandom = false;
     constexpr bool kHasPhysicalMap = false, kHasUnmappedTopkIdx = false;
     constexpr auto kFront2Format = static_cast<mega_gate_layout::Front2Format>(kFormat);
+    constexpr auto kFront2Rule = static_cast<mega_gate_layout::Front2Rule>(kRule);
     using Allocator = cute::conditional_t<kNumMmaCtas == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     constexpr uint32_t kNumNonEpilogueWarps = mega_gate_layout::kNumNonEpilogueThreads / 32;
@@ -300,7 +301,7 @@ sm100_bf16_mega_gate_front2_impl(const __grid_constant__ cute::TmaDescriptor ten
 
             // FRONT2: stage this block's hidden states in the official entry's format while the MMA warps stream the gate weights
             __syncwarp();
-            epilogue::mega_gate_front2::stage_front2<SHAPE_K, kNumGateWarps, kNumLogicalCtas, kFront2Format, kWithSharedX>(
+            epilogue::mega_gate_front2::stage_front2<SHAPE_K, kNumGateWarps, kNumLogicalCtas, kFront2Format, kWithSharedX, kFront2Rule>(
                 front_args, token_base_idx, token_end_idx, logical_cta_rank, gate_warp_idx, lane_idx);
 
             __syncwarp();
@@ -449,7 +450,7 @@ sm100_bf16_mega_gate_front2_impl(const __grid_constant__ cute::TmaDescriptor ten
                 }
 
                 // FRONT2: the stock weights, then padding, EPLB map, load record and the official route planes
-                epilogue::mega_gate_front2::store_front2_token<kNumRoutedExperts, kNumTopk, kHasImageTokenMask, kHasEplb, kHasPadding>(
+                epilogue::mega_gate_front2::store_front2_token<kNumRoutedExperts, kNumTopk, kHasImageTokenMask, kHasEplb, kHasPadding, kFront2Rule>(
                     routing_args, front_args, reinterpret_cast<const uint8_t*>(smem.metadata_cache),
                     front_record_on, front_num_unpadded,
                     global_token_idx, lane_idx, selected_expert_idx, selected_unbiased_score);
@@ -457,7 +458,7 @@ sm100_bf16_mega_gate_front2_impl(const __grid_constant__ cute::TmaDescriptor ten
         }
         // FRONT2: FlashInfer's fused tail mask, once per launch
         if (worker_group_idx == 0 and logical_cta_rank == 0)
-            epilogue::mega_gate_front2::mask_route_tail<kNumTopk, kNumGateThreads, kWithSharedX>(
+            epilogue::mega_gate_front2::mask_route_tail<kNumTopk, kNumGateThreads, kWithSharedX, kFront2Rule>(
                 front_args, num_tokens, threadIdx.x - mega_gate_layout::kNumNonEpilogueThreads);
     }
 

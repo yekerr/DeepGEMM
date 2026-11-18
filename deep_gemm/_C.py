@@ -765,15 +765,20 @@ def bf16_mega_gate_front2(
     num_unpadded_tokens=None,
     xs_q=None,
     xs_sf=None,
+    staging_rule=0,
 ):
     """FRONT2: ``bf16_mega_gate`` + the router's EPLB map / record + the official gen-phase entry's NVFP4 staging in one launch.
 
     Writes the activation / scale planes (uint8 views, plain rows) and the route planes (int32 physical ids with -1 over the
-    capacity tail, fp32 scores) of the official cutedsl_megamoe gen-phase kernel."""
+    capacity tail, fp32 scores) of the official cutedsl_megamoe gen-phase kernel.
+
+    ``staging_rule`` names the unfused staging whose bytes the planes reproduce: 0 (default) FlashInfer's fused_quant_stage /
+    DataPreprocess + shared staging; 1 the SM107 NVFP4 runtime's Triton ``stage_nvfp4_mxfp8`` (NVFP4 only; padded and tail rows
+    score 0, ``topk_weights`` must cover the capacity rows)."""
     _torch_ops.bf16_mega_gate_front2(
         x, weight, num_topk, routed_scaling_factor, ep_rank, scoring_func, bias, image_bias, image_token_mask, format,
         x_q, x_sf, norm_const, scale_multiplier, xs_q, xs_sf, topk_idx, topk_weights, is_padding, logical_to_physical, replica_count,
-        expert_load, record_enabled, num_unpadded_tokens,
+        expert_load, record_enabled, num_unpadded_tokens, staging_rule,
     )
 
 

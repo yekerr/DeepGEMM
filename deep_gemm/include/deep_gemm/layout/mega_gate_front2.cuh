@@ -16,6 +16,15 @@ enum class Front2Format : uint32_t {
                      // (FlashInfer fused_quant_stage(quant_type="mxfp8_e4m3", mxfp8_normal_scales=True): the SM107 MXFP4 x MXFP8 entry)
 };
 
+// Staging rules: whose unfused chain the planes reproduce bit for bit (format 0 / NVFP4; format 1 has rule 0 only)
+enum class Front2Rule : uint32_t {
+    kDataPreprocess = 0,   // FlashInfer fused_quant_stage -> cutedsl_megamoe DataPreprocess + FlashInfer's shared staging
+                           // (quantize_mxfp8_block32: scale floor 2^-126, X_s scale rows [T, padded) zero; padded tokens keep scores)
+    kSm107Triton = 1,      // the SM107 NVFP4 MegaMoE runtime's one-launch Triton staging (stage_nvfp4_mxfp8): NVFP4 data
+                           // x * div.full(norm, sf) (0 where sf is 0); X_s exponent from div.full(max(amax, 1e-30), 448); padded
+                           // and tail rows get score 0; X_s scale rows [T, padded) are not written
+};
+
 struct Front2Args {
     // Staging: x [T, H] BF16 (stride_k 1) -> x_q [>= T, H / 2] bytes, x_sf [>= T, H / 16] bytes (NVFP4) or x_q [>= T, H],
     // x_sf [>= T, H / 32] bytes (MXFP8) (row strides in bytes)
